@@ -1445,6 +1445,18 @@ class NeuronWorker(WorkerBase):
             available = self._determine_available_memory_cpu()
         else:
             available = self._determine_available_memory_neuron()
+        from vllm_neuron.vllm.model_runner_v2_policy import is_qwen35_text
+
+        if is_qwen35_text(self.vllm_config.model_config):
+            from vllm.v1.core.kv_cache_utils import _pool_bytes_per_block, get_kv_cache_groups
+
+            specs = self.get_kv_cache_spec()
+            groups = get_kv_cache_groups(self.vllm_config, dict(specs))
+            pooled = _pool_bytes_per_block(groups)
+            physical = sum(spec.page_size_bytes for spec in specs.values())
+            # The independent carriers in _initialize_fixed_hybrid_cache use
+            # one page per layer, including when the scheduler groups co-tenants.
+            available = available * min(pooled, physical) // physical
         return available
 
     def initialize_cache(self, num_gpu_blocks: int, num_cpu_blocks: int) -> None:

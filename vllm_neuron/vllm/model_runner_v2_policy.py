@@ -85,6 +85,13 @@ def _model_architectures(model_config: object) -> list[str]:
     return []
 
 
+QWEN35_TEXT_ARCHITECTURES = frozenset({"Qwen3_5ForCausalLM", "Qwen3_5ForConditionalGeneration"})
+
+
+def is_qwen35_text(model_config: object) -> bool:
+    return bool(QWEN35_TEXT_ARCHITECTURES.intersection(_model_architectures(model_config)))
+
+
 class NeuronModelRunnerPolicy(NamedTuple):
     """Describe whether the runner is enabled and why it may be unsupported.
 
@@ -164,6 +171,7 @@ def get_neuron_model_runner_v2_policy(
     scheduler_config = getattr(vllm_config, "scheduler_config", None)
     unsupported: list[str] = []
 
+    qwen35 = is_qwen35_text(model_config)
     dense_generate = model_config is not None
     if model_config is None:
         unsupported.append("missing model configuration")
@@ -187,7 +195,7 @@ def get_neuron_model_runner_v2_policy(
                 and not neuron_envs.VLLM_NEURON_ALLOW_V2_WIDE_EP
             ):
                 unsupported.append("Mixture-of-Experts with data parallelism")
-        if getattr(model_config, "is_hybrid", False):
+        if getattr(model_config, "is_hybrid", False) and not qwen35:
             unsupported.append("hybrid model")
             dense_generate = False
         if getattr(model_config, "is_attention_free", False):
@@ -196,7 +204,7 @@ def get_neuron_model_runner_v2_policy(
         if getattr(model_config, "is_encoder_decoder", False):
             unsupported.append("encoder-decoder model")
             dense_generate = False
-        if getattr(model_config, "multimodal_config", None) is not None:
+        if getattr(model_config, "multimodal_config", None) is not None and not qwen35:
             unsupported.append("multimodal model")
             dense_generate = False
         if getattr(model_config, "enable_prompt_embeds", False):
@@ -239,6 +247,16 @@ def get_neuron_model_runner_v2_policy(
         unsupported.append("LoRA")
     if getattr(vllm_config, "reasoning_config", None) is not None:
         unsupported.append("reasoning configuration")
+
+    if qwen35:
+        if getattr(cache_config, "cache_dtype", "auto") not in ("auto", "bfloat16"):
+            unsupported.append("non-BF16 KV cache on Qwen3.8")
+        if getattr(cache_config, "enable_prefix_caching", False):
+            unsupported.append("prefix caching on Qwen3.8")
+        if getattr(cache_config, "mamba_cache_mode", None) not in (None, "none"):
+            unsupported.append("non-fixed recurrent cache")
+        if getattr(vllm_config, "kv_transfer_config", None) is not None:
+            unsupported.append("KV transfer on Qwen3.8")
 
     if cache_config is not None:
         if getattr(cache_config, "kv_offloading_size", None) is not None:
@@ -402,6 +420,13 @@ def resolve_neuron_model_runner(vllm_config: "VllmConfig") -> bool:
         ``True`` when the standalone runner should be used.
     """
     override = vllm_envs.VLLM_USE_V2_MODEL_RUNNER
+    if is_qwen35_text(getattr(vllm_config, "model_config", None)):
+        if override is False:
+            raise ValueError("Qwen3.8 on Neuron requires Model Runner V2.")
+        unsupported = get_neuron_model_runner_v2_policy(vllm_config).unsupported_features
+        if unsupported:
+            raise ValueError("Unsupported Qwen3.8 V2 features: " + ", ".join(unsupported))
+        return True
     if override is not None:
         if override:
             unsupported = get_neuron_model_runner_v2_policy(

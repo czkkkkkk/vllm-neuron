@@ -307,6 +307,13 @@ class NeuronPlatform(Platform):
         if not cache_config.user_specified_block_size:
             cache_config.block_size = 32
 
+        from vllm_neuron.vllm.model_runner_v2_policy import is_qwen35_text
+
+        if is_qwen35_text(getattr(vllm_config, "model_config", None)):
+            from vllm_neuron.vllm.attention.attn import NeuronAttentionBackend
+
+            cls._align_hybrid_block_size(vllm_config, NeuronAttentionBackend)
+
         parallel_config = vllm_config.parallel_config
         if (
             parallel_config.decode_context_parallel_size > 1
@@ -618,6 +625,14 @@ class NeuronPlatform(Platform):
         # available, and write it to the shared neuron_config dict so the model
         # factory and the NIXL connector observe the same decision.
         architectures = getattr(model_config.hf_config, "architectures", None) or []
+        from vllm_neuron.vllm.model_runner_v2_policy import is_qwen35_text
+
+        if is_qwen35_text(model_config):
+            mm = getattr(model_config, "multimodal_config", None)
+            if mm is not None:
+                if getattr(mm, "mm_encoder_only", False) or vllm_config.ec_transfer_config:
+                    raise ValueError("Qwen3.8 on Neuron supports text input only.")
+                mm.language_model_only = True
         if "GptOssForCausalLM" in architectures:
             from vllm_neuron.model.gpt_oss.factory import should_use_gk_decode
             from libtorch_neuronx_lite.compile.platform import get_platform_target
@@ -760,7 +775,7 @@ class NeuronPlatform(Platform):
         # max_num_batched_tokens. The encoder budget cap in NeuronScheduler
         # already prevents overflow without needing this flag.
 
-        if hasattr(model_config.hf_config, "vision_config"):
+        if hasattr(model_config.hf_config, "vision_config") and not is_qwen35_text(model_config):
             cls._resolve_vision_auto_config(vllm_config, model_config)
 
         # Compute the per-item embed limit for request validation.

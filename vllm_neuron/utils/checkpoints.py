@@ -186,6 +186,32 @@ class SafetensorsCheckpoint:
         self._tensor_name_to_file = {}
         self._open_safetensor_files = {}
 
+    def tensor_dtypes(self) -> dict[str, str]:
+        """Return the stored dtype of each checkpoint tensor.
+
+        The method reads only the safetensors file headers. It downloads a
+        file that is not local yet. A loader casts each tensor to the dtype of
+        its parameter, so a caller that must know the stored dtype reads it
+        here.
+
+        Returns:
+            The safetensors dtype name of each tensor, for example ``"BF16"``
+            or ``"F8_E4M3"``.
+
+        Example:
+            >>> checkpoint = SafetensorsCheckpoint("/path/to/model")
+            >>> checkpoint.tensor_dtypes()["lm_head.weight"]  # doctest: +SKIP
+            'BF16'
+        """
+        dtypes: dict[str, str] = {}
+        for file_name in self._safetensor_file_names:
+            self._source.download_file(file_name)
+            path = self._source.get_file_path(file_name)
+            with safe_open(path, framework="pt", device="cpu") as handle:
+                for key in handle.keys():
+                    dtypes[key] = handle.get_slice(key).get_dtype()
+        return dtypes
+
     def load_sharded(
         self,
         rank: int,

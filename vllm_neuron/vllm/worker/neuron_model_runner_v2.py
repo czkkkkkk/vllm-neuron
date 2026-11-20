@@ -323,6 +323,7 @@ class NeuronModelRunnerV2:
         # KV-cache placeholders published by initialize_kv_cache.
         self._kv_cache_config = None
         self.kv_caches: dict = {}
+        self._recurrent_groups: list[bool] = []
         # Block-table snapshot for KV-cache analysis (accuracy debugger). The
         # first get_block_tables RPC enables snapshotting; execute_model then
         # keeps a slot-indexed host copy of the block rows each step so the
@@ -753,8 +754,9 @@ class NeuronModelRunnerV2:
         Raises:
             RuntimeError: If the model has not been loaded.
         """
-        from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec, SlidingWindowSpec
 
+        from vllm_neuron.model.kv_cache import RecurrentLayerSpec
         from vllm_neuron.utils.dtype_utils import kv_cache_dtype_str_to_dtype
 
         if self.model is None:
@@ -765,6 +767,23 @@ class NeuronModelRunnerV2:
         )
         specs: dict = {}
         for layer in self.model.get_kv_spec().layers:
+            if isinstance(layer, RecurrentLayerSpec):
+                cache = self.vllm_config.cache_config
+                if cache.mamba_cache_mode != "none" or cache.enable_prefix_caching:
+                    raise ValueError("Recurrent state on this runner requires fixed pages without prefix caching.")
+                if not isinstance(cache.mamba_block_size, int) or cache.mamba_block_size <= 0:
+                    raise ValueError("Resolve the recurrent cache block size before allocating state.")
+                specs[layer.name] = MambaSpec(
+                    block_size=cache.mamba_block_size,
+                    shapes=layer.state_shapes,
+                    dtypes=layer.state_dtypes,
+                    page_size_padded=cache.mamba_page_size_padded,
+                    mamba_type=layer.state_backend_type,
+                    num_heads=layer.state_num_heads,
+                    tokens_per_state=layer.state_tokens_per_state,
+                    tp_replicated=layer.state_tp_replicated,
+                )
+                continue
             if getattr(layer, "sliding_window_size", None) is not None:
                 # SlidingWindowSpec (not FullAttentionSpec) so the hybrid KV
                 # cache manager creates a separate group whose blocks outside
@@ -914,6 +933,52 @@ class NeuronModelRunnerV2:
     # ------------------------------------------------------------------
     # KV-cache allocation: one-shot, preflight-validated, publish-last.
     # ------------------------------------------------------------------
+    def _initialize_fixed_hybrid_cache(self, config):
+        """Give each GDN layer an independent page carrier.
+
+        The scheduler still owns the page IDs. Independent bases avoid aliasing
+        full attention K/V with a recurrent state in the compiled graph. The
+        worker budgets for the unshared allocations before the scheduler chooses
+        its block count.
+        """
+        from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
+
+        specs = self.get_kv_cache_spec()
+        names = [name for group in config.kv_cache_groups for name in group.layer_names]
+        if len(names) != len(set(names)) or set(names) != specs.keys():
+            raise ValueError("Hybrid cache group layers differ from the loaded model.")
+        recurrent = []
+        sizes = []
+        for group in config.kv_cache_groups:
+            spec = group.kv_cache_spec
+            if not isinstance(spec, (MambaSpec, FullAttentionSpec)):
+                raise ValueError(f"Unsupported hybrid cache group {type(spec).__name__}")
+            if any(specs[name] != spec for name in group.layer_names):
+                raise ValueError("Hybrid cache layout changed after memory planning.")
+            recurrent.append(isinstance(spec, MambaSpec))
+            sizes.append(spec.block_size)
+        caches = {}
+        for name, spec in specs.items():
+            if isinstance(spec, MambaSpec):
+                # Page IDs are shared, storage is not. Separate typed state
+                # tensors avoid a BF16/FP32 bitcast in the compiled prefill.
+                caches[name] = [
+                    torch.zeros((config.num_blocks, *shape), dtype=dtype, device=self.device)
+                    for shape, dtype in zip(spec.shapes, spec.dtypes, strict=True)
+                ]
+            else:
+                shape = (config.num_blocks, spec.num_kv_heads, spec.block_size, spec.head_size)
+                caches[name] = [torch.zeros(shape, dtype=spec.dtype, device=self.device) for _ in range(2)]
+        self.model.bind_kv_cache(caches)
+        self.request_state.configure_block_sizes(sizes)
+        self.block_sizes = sizes
+        self._recurrent_groups = recurrent
+        self._swa_num_blocks = [None] * len(sizes)
+        self._kv_cache_config = config
+        self.kv_caches = caches
+        self.kv_connector = get_kv_connector(self.vllm_config, {})
+        return caches
+
     def initialize_kv_cache(self, kv_cache_config) -> dict[str, list[torch.Tensor]]:
         """Allocate + bind the device KV cache from a grouped config, atomically.
 
@@ -964,6 +1029,10 @@ class NeuronModelRunnerV2:
                 "V2 standalone runner does not support the packed FP8 KV layout (fp8_packed_kv); "
                 "such configs must route to V1"
             )
+
+        from vllm.v1.kv_cache_interface import MambaSpec
+        if any(isinstance(g.kv_cache_spec, MambaSpec) for g in kv_cache_config.kv_cache_groups):
+            return self._initialize_fixed_hybrid_cache(kv_cache_config)
 
         # --- preflight validation (host-only; ENTIRELY before any allocation) ---
         # Resolve each group into per-layer specs. Reject unsupported spec types
@@ -1293,6 +1362,11 @@ class NeuronModelRunnerV2:
             slot_mappings=model_input.slot_mappings,
             swa_kv_pos_offsets=model_input.swa_kv_pos_offsets,
         )
+        if model_input.recurrent_metadata:
+            for group, metadata in zip(self._kv_cache_config.kv_cache_groups, model_input.recurrent_metadata, strict=True):
+                if metadata is not None:
+                    for layer in group.layer_names:
+                        attn_metadata[layer] = {**attn_metadata[layer], **metadata}
         rs = self.request_state
 
         def state_tensor(name: str, tensor: torch.Tensor) -> torch.Tensor:
@@ -2488,6 +2562,7 @@ class NeuronModelRunnerV2:
             token_bucket=token_bucket,
             row_bucket=row_bucket,
             kv_segment_size=kv_segment_size,
+            validate_live_pages=True,
         )
 
     def _assemble_model_input(
@@ -2502,6 +2577,7 @@ class NeuronModelRunnerV2:
         row_bucket: int,
         kv_segment_size: int,
         device: torch.device | None = None,
+        validate_live_pages: bool = False,
     ) -> NeuronModelInput:
         """Pad host vectors and assemble a fixed-shape model input.
 
@@ -2564,7 +2640,37 @@ class NeuronModelRunnerV2:
         block_tables = []
         swa_kv_pos_offsets: list[torch.Tensor | None] = []
         slot_mappings_flat: list[np.ndarray] = []
+        recurrent_metadata = []
         for g in range(len(self.block_sizes)):
+            if self._recurrent_groups and self._recurrent_groups[g]:
+                from vllm_neuron.model.kv_cache import resolve_fixed_mamba_state_transition
+
+                # The host table has max_model_len-based capacity. Fixed state
+                # lives in its first column, independent of the token position.
+                raw = gather_block_rows_raw(rs, g, idx_mapping_np, padded_num_reqs)
+                if validate_live_pages and (
+                    np.any(raw[:num_active, 0] <= 0)
+                    or np.any(raw[:num_active, 0] >= self._kv_cache_config.num_blocks)
+                ):
+                    raise ValueError(f"Scheduled request has no valid fixed recurrent page in group {g}")
+                pages = torch.from_numpy(raw[:, :1].copy())
+                counts = torch.zeros(padded_num_reqs, dtype=torch.int64)
+                scheduled = torch.zeros_like(counts)
+                counts[:num_active] = torch.from_numpy(num_computed)
+                scheduled[:num_active] = torch.from_numpy(query_lens)
+                transition = resolve_fixed_mamba_state_transition(
+                    pages, num_speculative_blocks=0,
+                    state_cold=(counts == 0) | (scheduled == 0),
+                    output_checkpoint_valid=(scheduled > 0)[:, None],
+                )
+                metadata = transition.as_attention_metadata()
+                metadata["recurrent_state_cold"] = ~transition.read_state_valid
+                recurrent_metadata.append({key: value.contiguous().to(device) for key, value in metadata.items()})
+                block_tables.append(pages.to(device))
+                swa_kv_pos_offsets.append(None)
+                slot_mappings_flat.append(np.full(total_scored, NULL_BLOCK_ID, dtype=np.int64))
+                continue
+            recurrent_metadata.append(None)
             swa_width = self._swa_num_blocks[g]
             if swa_width is not None and not is_prefill:
                 rows, offsets = build_swa_kernel_block_rows(
@@ -2710,6 +2816,7 @@ class NeuronModelRunnerV2:
             linear_idx=_to_dev(linear_idx) if linear_idx is not None else None,
             slot_mappings=tuple(_to_dev(m) for m in slot_mappings),
             swa_kv_pos_offsets=tuple(swa_kv_pos_offsets),
+            recurrent_metadata=tuple(recurrent_metadata) if self._recurrent_groups else (),
         )
 
     # ------------------------------------------------------------------

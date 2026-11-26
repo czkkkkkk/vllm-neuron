@@ -1398,13 +1398,30 @@ class NeuronModelRunnerV2:
             "last_sampled_tokens": state_tensor(
                 "last_sampled_tokens", rs.last_sampled_tokens
             ),
-            "sampling_params": state_tensor("sampling_params", rs.sampling_params),
+            # Per-row [R, 3] sampling parameters, selected on the host (not request state:
+            # a fresh per-step tensor, so dummies and placeholders need no substitute).
+            "sampling_params": self._sampling_rows_operand(model_input),
             "rank": rank,
             "linear_idx": model_input.linear_idx,
             "next_token_by_slot": state_tensor(
                 "next_token_by_slot", self._next_token_by_slot
             ),
         }
+
+    def _sampling_rows_operand(self, model_input: NeuronModelInput) -> torch.Tensor:
+        """Return the ``[R, 3]`` per-row sampling parameters for one adapter call.
+
+        ``_assemble_model_input`` selects them on the host; a model input built
+        without them (legacy constructors) falls back to the same host selection
+        from its ``row_to_slot``.
+        """
+        rows = model_input.sampling_rows
+        if rows is None:
+            slots = model_input.row_to_slot.detach().cpu().numpy()
+            rows = torch.from_numpy(self.request_state.sampling_rows(slots)).to(
+                model_input.row_to_slot.device
+            )
+        return rows
 
     def _record_neff_execution(self, model_input: NeuronModelInput) -> None:
         """Record one dispatch in the compatible execution metric bucket.
@@ -2310,7 +2327,6 @@ class NeuronModelRunnerV2:
                 "num_computed_tokens": torch.zeros_like(rs.num_computed_tokens),
                 "total_len": torch.zeros_like(rs.total_len),
                 "last_sampled_tokens": torch.zeros_like(rs.last_sampled_tokens),
-                "sampling_params": torch.zeros_like(rs.sampling_params),
                 "next_token_by_slot": torch.zeros_like(self._next_token_by_slot),
             }
         return self._dp_dummy_state
@@ -2711,10 +2727,15 @@ class NeuronModelRunnerV2:
             slot_mappings.append(padded)
         slot_mapping = slot_mappings[0]
 
-        # row_to_slot [R] (common): the sampling_params row-select on both flavors + the decode store
-        # gather. Pad rows carry the in-bounds slot 0 (never -1), masked out by input_valid_mask.
+        # row_to_slot [R] (common): the decode store gather. Pad rows carry the in-bounds slot 0
+        # (never -1), masked out by input_valid_mask.
         row_to_slot = np.zeros(num_sample_rows, dtype=np.int64)
         row_to_slot[:num_active] = slots[:num_active]
+        # sampling_rows [R, 3] (common): the per-row sampling parameters, selected on the host from
+        # the request state's mirror and handed to the graph as an input. The former in-graph
+        # index_select of the device table followed by the sampler's column slices mis-read all
+        # three parameters from the top_p column when R == 1 (prefill) on the native route.
+        sampling_rows = rs.sampling_rows(row_to_slot)
 
         # input_valid_mask marks real tokens (prefill, [P]) / real rows (decode, [B]).
         if is_prefill:
@@ -2817,6 +2838,7 @@ class NeuronModelRunnerV2:
             slot_mappings=tuple(_to_dev(m) for m in slot_mappings),
             swa_kv_pos_offsets=tuple(swa_kv_pos_offsets),
             recurrent_metadata=tuple(recurrent_metadata) if self._recurrent_groups else (),
+            sampling_rows=_to_dev(sampling_rows),
         )
 
     # ------------------------------------------------------------------

@@ -954,7 +954,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsEagle3):
     """Qwen3 model with LM head.
 
     >>> PARALLELISM: Column-parallel LM head. <<<
-    <-- MODEL-SPECIFIC: No tied embeddings (tie_word_embeddings=False).
+    <-- MODEL-SPECIFIC: Separate lm_head parameter; a tied checkpoint loads it
+    from the embedding weights (see load_weights).
 
     Implements ``SupportsEagle3``, so this model can be the *target* (verifier)
     for an Eagle3 draft head: the backbone collects aux hidden states at the
@@ -984,7 +985,8 @@ class Qwen3ForCausalLM(nn.Module, SupportsEagle3):
             config.neuron_config is not None and config.neuron_config.max_logprobs != 0
         ) or debug_logits_enabled
 
-        # <-- MODEL-SPECIFIC: No tied embeddings — separate lm_head weight
+        # <-- MODEL-SPECIFIC: Separate lm_head weight (tied checkpoints load it
+        # from model.embed_tokens.weight in load_weights)
         # >>> PARALLELISM: Column-parallel LM head <<<
         self.lm_head = neuron_nn.ColumnParallelLinear(
             config.hidden_size,
@@ -1182,7 +1184,14 @@ class Qwen3ForCausalLM(nn.Module, SupportsEagle3):
 
         # Embedding and LM head
         mappings["model.embed_tokens.weight"] = "model.embed_tokens.weight"
-        mappings["lm_head.weight"] = "lm_head.weight"
+        # <-- MODEL-SPECIFIC: Tied checkpoints (Qwen3-0.6B/1.7B/4B) store no
+        # lm_head.weight; load the column-parallel head from the embedding key,
+        # as Llama3ForCausalLM does.
+        mappings["lm_head.weight"] = (
+            "model.embed_tokens.weight"
+            if self.config.tie_word_embeddings
+            else "lm_head.weight"
+        )
         mappings["model.norm.weight"] = "model.norm.weight"
 
         for layer_id in range(len(self.model.layers)):

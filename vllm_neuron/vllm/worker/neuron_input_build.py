@@ -90,6 +90,10 @@ class NeuronModelInput:
     # decode ([B] int32); None entries for full-attention groups and prefill.
     swa_kv_pos_offsets: tuple[torch.Tensor | None, ...] | None = None
     recurrent_metadata: tuple[dict[str, torch.Tensor] | None, ...] = ()
+    # Per sampled row [R, 3] float32 ``[top_k, top_p, temperature]``, selected on the
+    # host by stable slot (``NeuronRequestState.sampling_rows``); padding rows carry
+    # slot 0's values. A graph input, never gathered in-graph (see the adapter).
+    sampling_rows: torch.Tensor | None = None
 
 
 def build_flat_positions(

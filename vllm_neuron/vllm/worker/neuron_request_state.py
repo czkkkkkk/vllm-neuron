@@ -86,19 +86,17 @@ def block_row_width(max_model_len: int, block_size: int) -> int:
     return n
 
 
-def _sampling_row(sampling_params, device: torch.device) -> torch.Tensor:
-    """Build one device-resident sampling-parameter row.
+def _sampling_values(sampling_params) -> tuple[float, float, float]:
+    """Normalize one request's sampling values to ``(top_k, top_p, temperature)``.
 
     Use the greedy or disabled defaults for missing attributes. Normalize
     ``top_k`` values of ``None`` or at most zero to the ``-1`` sentinel.
 
     Args:
         sampling_params (SamplingParams | None): Sampling values to normalize.
-        device: Device on which to create the row.
 
     Returns:
-        A float32 ``[3]`` tensor containing ``top_k``, ``top_p``, and
-        ``temperature``.
+        The ``top_k``, ``top_p`` and ``temperature`` floats of the row.
     """
     top_k = getattr(sampling_params, "top_k", None)
     top_p = getattr(sampling_params, "top_p", None)
@@ -106,7 +104,23 @@ def _sampling_row(sampling_params, device: torch.device) -> torch.Tensor:
     top_k = _DEFAULT_TOP_K if (top_k is None or top_k <= 0) else float(top_k)
     top_p = _DEFAULT_TOP_P if top_p is None else float(top_p)
     temperature = _DEFAULT_TEMPERATURE if temperature is None else float(temperature)
-    return torch.tensor([top_k, top_p, temperature], dtype=torch.float32, device=device)
+    return top_k, top_p, temperature
+
+
+def _sampling_row(sampling_params, device: torch.device) -> torch.Tensor:
+    """Build one device-resident sampling-parameter row.
+
+    Args:
+        sampling_params (SamplingParams | None): Sampling values to normalize.
+        device: Device on which to create the row.
+
+    Returns:
+        A float32 ``[3]`` tensor containing ``top_k``, ``top_p``, and
+        ``temperature`` (see :func:`_sampling_values`).
+    """
+    return torch.tensor(
+        _sampling_values(sampling_params), dtype=torch.float32, device=device
+    )
 
 
 class NeuronRequestState:
@@ -180,6 +194,21 @@ class NeuronRequestState:
                 axis=0,
             )
         ).to(device)
+        # Host mirror of the same [max_num_reqs, 3] table. The per-step sampled rows
+        # ([R, 3], see :meth:`sampling_rows`) are selected from it on the host and enter
+        # the compiled graph as an input: gathering the row inside the graph and slicing
+        # its three columns mis-reads all three parameters from the top_p column on the
+        # native route when the graph samples a single row (prefill), which made every
+        # request's first token greedy at top_p=1.0 and ignore temperature/top_k.
+        # Sampling values are immutable after admission, so the mirror is exact.
+        self.sampling_params_host = np.repeat(
+            np.array(
+                [[_DEFAULT_TOP_K, _DEFAULT_TOP_P, _DEFAULT_TEMPERATURE]],
+                dtype=np.float32,
+            ),
+            max_num_reqs,
+            axis=0,
+        )
 
         # Host advisory progress (scheduler-derived upper bound; NOT authoritative).
         self.scheduler_num_computed_tokens = np.zeros(max_num_reqs, dtype=np.int32)
@@ -468,7 +497,10 @@ class NeuronRequestState:
         else:
             seed = 0
         last_sampled_row = torch.tensor([[seed]], dtype=torch.int32, device=self.device)
-        sampling_row = _sampling_row(sampling_params, self.device).unsqueeze(0)
+        sampling_values = _sampling_values(sampling_params)
+        sampling_row = torch.tensor(
+            [sampling_values], dtype=torch.float32, device=self.device
+        )
 
         # All checks passed. Use the caller's safe release path when replacing
         # a request that already has a slot.
@@ -510,7 +542,23 @@ class NeuronRequestState:
         self.total_len[row].copy_(total_len_row)
         self.last_sampled_tokens[row].copy_(last_sampled_row)
         self.sampling_params[row].copy_(sampling_row)
+        self.sampling_params_host[slot] = sampling_values
         return slot
+
+    def sampling_rows(self, row_to_slot: np.ndarray) -> np.ndarray:
+        """Select the per-row ``[top_k, top_p, temperature]`` rows for one step on the host.
+
+        Args:
+            row_to_slot: ``[R]`` output row -> stable slot; padding rows may carry
+                ``-1`` and resolve to slot 0 (their samples are masked out anyway).
+
+        Returns:
+            A new float32 ``[R, 3]`` array, one row per sampled output row.
+        """
+        slots = np.clip(
+            np.asarray(row_to_slot, dtype=np.int64), 0, self.max_num_reqs - 1
+        )
+        return np.ascontiguousarray(self.sampling_params_host[slots], dtype=np.float32)
 
     def remove_request(self, req_id: str) -> int | None:
         """Free a request slot and clear its block rows.

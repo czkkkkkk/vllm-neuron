@@ -230,7 +230,7 @@ class NeuronForwardAdapter(torch.nn.Module):
         * Builds prefill inputs from `linear_idx`.
         * Builds initial decode inputs from token history.
         * Builds subsequent decode inputs from the previous non-aliased output.
-        * Selects sampling parameters by stable slot.
+        * Passes the per-row sampling parameters through (selected on the host).
         * Runs the model.
         * Updates token history in place.
 
@@ -254,7 +254,9 @@ class NeuronForwardAdapter(torch.nn.Module):
             num_computed_tokens: Device-authoritative computed-token counts.
             total_len: Device-authoritative token-history lengths.
             last_sampled_tokens: Persistent sampled-token store.
-            sampling_params: Per-slot sampling parameters.
+            sampling_params: Per-row ``[R, 3]`` sampling parameters, already
+                selected by stable slot on the host
+                (``NeuronRequestState.sampling_rows``).
             rank: Tensor-parallel rank tensor passed to the model.
             next_token_by_slot: Non-aliased sampled-token output from the
                 previous step.
@@ -311,12 +313,13 @@ class NeuronForwardAdapter(torch.nn.Module):
                 input_valid_mask, input_ids, torch.full_like(input_ids, PAD_TOKEN)
             )
 
-        # Padded rows use -1 for the decode-input preserve sentinel. Clamp only
-        # for this gather; their selected parameters are masked and ignored.
-        sampling_row_to_slot = torch.clamp(row_to_slot, min=0)
-        selected_sampling_params = torch.index_select(
-            sampling_params, 0, sampling_row_to_slot
-        )
+        # The sampling parameters arrive per row ([R, 3]) and are used as-is. They used
+        # to be gathered here from the [max_num_reqs, 3] device table by row_to_slot; on
+        # the native route the compiled graph then read the sampler's three column slices
+        # of that single-row (R == 1, prefill) intermediate all from the top_p column, so
+        # every request's first token was greedy at top_p=1.0 and ignored temperature
+        # and top_k (measured on trn2). Selecting the rows on the host and feeding them
+        # as a graph input (as the runner does) keeps the slices exact.
 
         # --- call the UNCHANGED model by keyword (args[0..1] are inputs_embeds/is_token_ids) ---
         result = self.model(
@@ -324,7 +327,7 @@ class NeuronForwardAdapter(torch.nn.Module):
             positions=positions,
             attn_metadata=attn_metadata,
             sampling_positions=sampling_positions,
-            sampling_params=selected_sampling_params,
+            sampling_params=sampling_params,
             logit_mask=None,
             rank=rank,
         )

@@ -288,8 +288,11 @@ def _top_p_filter(probs: Tensor, p: Tensor) -> Tensor:
     triu = torch.triu(probs.new_ones((vocab_size, vocab_size)))
     cumsum_sorted = sorted_probs @ triu
 
-    # Mask where cumsum exceeds per-row p threshold
-    sorted_mask = cumsum_sorted > p
+    # vLLM's rule (apply_top_k_top_p_pytorch: ascending cumsum <= 1 - p): mask a token once
+    # the cumulative probability of the strictly larger tokens has reached p, so the token
+    # that crosses the threshold is kept. Masking on the inclusive cumsum dropped it, which
+    # collapsed small nuclei (e.g. a 0.5/0.5 pair at top_p=0.6) to the top token alone.
+    sorted_mask = (cumsum_sorted - sorted_probs) >= p
     sorted_mask[..., 0] = False  # Always keep at least one token
     sorted_probs = sorted_probs.masked_fill(sorted_mask, 0.0)
 

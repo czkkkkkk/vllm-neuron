@@ -23,6 +23,10 @@ from vllm_neuron.utils.neuron_utils import can_run_kernel
 
 cascaded_max_jit = nki.jit()(cascaded_max)
 
+# nc_find_index8 (used by cascaded_max) reads at most this many elements per
+# partition; see nki.isa.nc_find_index8.
+_MAX_FIND_INDEX_ELEMENTS = 16384
+
 logger = logging.getLogger(__name__)
 
 
@@ -176,6 +180,7 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     - Tensor must be 2D or 3D with shape[0] == 1
     - Reduction dimension must have at least 128 elements
     - Partition dimension (shape[-2]) must be <= nl.tile_size.pmax * grid
+    - Each partition reduces at most _MAX_FIND_INDEX_ELEMENTS elements
     """
     if not can_run_kernel(tensor):
         return False
@@ -199,6 +204,20 @@ def _can_use_nki_max(tensor: Tensor, dim: int) -> bool:
     # across `grid` programs. Each program gets a maximum of pmax rows.
     grid = 1 if envs.VLLM_NEURON_CPU_MODE else get_logical_nc_config()
     if shape[-2] > nl.tile_size.pmax * grid:
+        return False
+
+    # Check the per-partition reduction width. The kernel folds the reduction
+    # dim into n_stages partition groups, using the partitions left free by each
+    # program's rows (cascaded_max's cascading constants), and nc_find_index8
+    # accepts at most _MAX_FIND_INDEX_ELEMENTS per partition. A wide vocab shard
+    # with many rows exceeds it (e.g. Qwen3's 151936 vocab at TP8 is 18992 per
+    # rank: 129-256 rows fail under LNC2), and the kernel then aborts at trace
+    # time instead of falling back. Use torch.max for those shapes.
+    rows_per_program = -(-shape[-2] // grid)
+    n_stages = min(
+        nl.tile_size.pmax // rows_per_program, shape[dim] // nl.tile_size.pmax
+    )
+    if -(-shape[dim] // n_stages) > _MAX_FIND_INDEX_ELEMENTS:
         return False
 
     return True
